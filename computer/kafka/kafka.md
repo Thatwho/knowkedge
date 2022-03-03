@@ -2297,3 +2297,416 @@ public final class RecordAccumulator {
 `LINGER_MS_CONFIG`配置的是send等待时间，主要用于非阻塞的情况下，每次收到数据后，如果batch没有填充满，会使batch等待`LINGER_MS_CONFIG`配置的时间后再发送出去。使尽可能实现批量发送，提高性能。
 
 ### producer和broker的通信
+无论是生产者还是消费者，在处理数据之前一定需要先知道集群的元信息，才知道和那里的服务器通信。
+```java
+public class KafkaProducer<K, V> implements Producer<K, V> {
+    ...
+    private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback callback) {
+        TopicPartition tp = null;
+        try {
+            throwIfProducerClosed();
+            // first make sure the metadata for the topic is available
+            long nowMs = time.milliseconds();
+            ClusterAndWaitTime clusterAndWaitTime;
+            try {
+                clusterAndWaitTime = waitOnMetadata(record.topic(), record.partition(), nowMs, maxBlockTimeMs);
+            } catch (KafkaException e) {
+                if (metadata.isClosed())
+                    throw new KafkaException("Producer closed while send in progress", e);
+                throw e;
+            }
+            ...
+        }
+    }
+}
+```
+producer在实际发送前，通过`waitOnMetadata`方法获取元信息。
+```java
+public class KafkaProducer<K, V> implements Producer<K, V> {
+    ...
+    private ClusterAndWaitTime waitOnMetadata(String topic, Integer partition, long nowMs, long maxWaitMs) throws InterruptedException {
+        // add topic to metadata topic list if it is not there already and reset expiry
+        Cluster cluster = metadata.fetch();
+
+        if (cluster.invalidTopics().contains(topic))
+            throw new InvalidTopicException(topic);
+
+        metadata.add(topic, nowMs);
+
+        Integer partitionsCount = cluster.partitionCountForTopic(topic);
+        // Return cached metadata if we have it, and if the record's partition is either undefined
+        // or within the known partition range
+        if (partitionsCount != null && (partition == null || partition < partitionsCount))
+            return new ClusterAndWaitTime(cluster, 0);
+
+        long remainingWaitMs = maxWaitMs;
+        long elapsed = 0;
+        // Issue metadata requests until we have metadata for the topic and the requested partition,
+        // or until maxWaitTimeMs is exceeded. This is necessary in case the metadata
+        // is stale and the number of partitions for this topic has increased in the meantime.
+        do {
+            if (partition != null) {
+                log.trace("Requesting metadata update for partition {} of topic {}.", partition, topic);
+            } else {
+                log.trace("Requesting metadata update for topic {}.", topic);
+            }
+            metadata.add(topic, nowMs + elapsed);
+            int version = metadata.requestUpdateForTopic(topic);
+            sender.wakeup();
+            try {
+                metadata.awaitUpdate(version, remainingWaitMs);
+            } catch (TimeoutException ex) {
+                // Rethrow with original maxWaitMs to prevent logging exception with remainingWaitMs
+                throw new TimeoutException(
+                        String.format("Topic %s not present in metadata after %d ms.",
+                                topic, maxWaitMs));
+            }
+            cluster = metadata.fetch();
+            elapsed = time.milliseconds() - nowMs;
+            if (elapsed >= maxWaitMs) {
+                throw new TimeoutException(partitionsCount == null ?
+                        String.format("Topic %s not present in metadata after %d ms.",
+                                topic, maxWaitMs) :
+                        String.format("Partition %d of topic %s with partition count %d is not present in metadata after %d ms.",
+                                partition, topic, partitionsCount, maxWaitMs));
+            }
+            metadata.maybeThrowExceptionForTopic(topic);
+            remainingWaitMs = maxWaitMs - elapsed;
+            partitionsCount = cluster.partitionCountForTopic(topic);
+        } while (partitionsCount == null || (partition != null && partition >= partitionsCount));
+
+        return new ClusterAndWaitTime(cluster, elapsed);
+    }
+    ...
+}
+```
+首次循环时，producer线程中还没有有效的`partitionsCount`或`partition`时，`waitOnMeatadata`方法会循环执行:
+```java
+            int version = metadata.requestUpdateForTopic(topic);
+            sender.wakeup();
+```
+其中`requestUpdateForTopic`方法：
+```java
+public class ProducerMetadata extends Metadata {
+    ...
+    public synchronized int requestUpdateForTopic(String topic) {
+        if (newTopics.contains(topic)) {
+            return requestUpdateForNewTopics();
+        } else {
+            return requestUpdate();
+        }
+    }
+    ...
+}
+```
+而在生产者刚启动时，生产者中没有topic，所以执行`requestUpdate`方法：
+```java
+public class ProducerMetadata extends Metadata {
+    ...
+        public synchronized int requestUpdate() {
+        this.needFullUpdate = true;
+        return this.updateVersion;
+    }
+    ...
+}
+```
+可以看到，`requestUpdata`方法主要是把`needFullUpdate`参数置`true`。
+之后`producer`线程唤醒`sender`线程：`sender.weakup()`。
+```java
+public class Sender implements Runnable {
+    ...
+    @Override
+    public void run() {
+        log.debug("Starting Kafka producer I/O thread.");
+
+        // main loop, runs until close is called
+        while (running) {
+            try {
+                runOnce();
+            } catch (Exception e) {
+                log.error("Uncaught error in kafka producer I/O thread: ", e);
+            }
+        }
+
+        log.debug("Beginning shutdown of Kafka producer I/O thread, sending remaining records.");
+
+        // okay we stopped accepting requests but there may still be
+        // requests in the transaction manager, accumulator or waiting for acknowledgment,
+        // wait until these are completed.
+        while (!forceClose && ((this.accumulator.hasUndrained() || this.client.inFlightRequestCount() > 0) || hasPendingTransactionalRequests())) {
+            try {
+                runOnce();
+            } catch (Exception e) {
+                log.error("Uncaught error in kafka producer I/O thread: ", e);
+            }
+        }
+
+        // Abort the transaction if any commit or abort didn't go through the transaction manager's queue
+        while (!forceClose && transactionManager != null && transactionManager.hasOngoingTransaction()) {
+            if (!transactionManager.isCompleting()) {
+                log.info("Aborting incomplete transaction due to shutdown");
+                transactionManager.beginAbort();
+            }
+            try {
+                runOnce();
+            } catch (Exception e) {
+                log.error("Uncaught error in kafka producer I/O thread: ", e);
+            }
+        }
+
+        if (forceClose) {
+            // We need to fail all the incomplete transactional requests and batches and wake up the threads waiting on
+            // the futures.
+            if (transactionManager != null) {
+                log.debug("Aborting incomplete transactional requests due to forced shutdown");
+                transactionManager.close();
+            }
+            log.debug("Aborting incomplete batches due to forced shutdown");
+            this.accumulator.abortIncompleteBatches();
+        }
+        try {
+            this.client.close();
+        } catch (Exception e) {
+            log.error("Failed to close network client", e);
+        }
+
+        log.debug("Shutdown of Kafka producer I/O thread has completed.");
+    }
+
+    /**
+     * Run a single iteration of sending
+     *
+     */
+    void runOnce() {
+        if (transactionManager != null) {
+            try {
+                transactionManager.maybeResolveSequences();
+
+                // do not continue sending if the transaction manager is in a failed state
+                if (transactionManager.hasFatalError()) {
+                    RuntimeException lastError = transactionManager.lastError();
+                    if (lastError != null)
+                        maybeAbortBatches(lastError);
+                    client.poll(retryBackoffMs, time.milliseconds());
+                    return;
+                }
+
+                // Check whether we need a new producerId. If so, we will enqueue an InitProducerId
+                // request which will be sent below
+                transactionManager.bumpIdempotentEpochAndResetIdIfNeeded();
+
+                if (maybeSendAndPollTransactionalRequest()) {
+                    return;
+                }
+            } catch (AuthenticationException e) {
+                // This is already logged as error, but propagated here to perform any clean ups.
+                log.trace("Authentication exception while processing transactional request", e);
+                transactionManager.authenticationFailed(e);
+            }
+        }
+
+        long currentTimeMs = time.milliseconds();
+        long pollTimeout = sendProducerData(currentTimeMs);
+        client.poll(pollTimeout, currentTimeMs);
+    }
+    ...
+}
+```
+可以看到`sender`被唤醒后，最终主要逻辑在`client.poll`中，即，kafka自行封装的NIO对象的poll方法：
+```java
+public class NetworkClient implements KafkaClient {
+    ...
+    @Override
+    public List<ClientResponse> poll(long timeout, long now) {
+        ensureActive();
+
+        if (!abortedSends.isEmpty()) {
+            // If there are aborted sends because of unsupported version exceptions or disconnects,
+            // handle them immediately without waiting for Selector#poll.
+            List<ClientResponse> responses = new ArrayList<>();
+            handleAbortedSends(responses);
+            completeResponses(responses);
+            return responses;
+        }
+
+        long metadataTimeout = metadataUpdater.maybeUpdate(now);
+        try {
+            this.selector.poll(Utils.min(timeout, metadataTimeout, defaultRequestTimeoutMs));
+        } catch (IOException e) {
+            log.error("Unexpected error during I/O", e);
+        }
+
+        // process completed actions
+        long updatedNow = this.time.milliseconds();
+        List<ClientResponse> responses = new ArrayList<>();
+        handleCompletedSends(responses, updatedNow);
+        handleCompletedReceives(responses, updatedNow);
+        handleDisconnections(responses, updatedNow);
+        handleConnections();
+        handleInitiateApiVersionRequests(updatedNow);
+        handleTimedOutConnections(responses, updatedNow);
+        handleTimedOutRequests(responses, updatedNow);
+        completeResponses(responses);
+
+        return responses;
+    }
+    ...
+}
+```
+在client的poll中，首先会执行`maybeUpdate`方法：
+```java
+public class NetworkClient implements KafkaClient {
+    ...
+    class DefaultMetadataUpdater implements MetadataUpdater {
+        ...
+        @Override
+        public long maybeUpdate(long now) {
+            // should we update our metadata?
+            long timeToNextMetadataUpdate = metadata.timeToNextUpdate(now);
+            long waitForMetadataFetch = hasFetchInProgress() ? defaultRequestTimeoutMs : 0;
+
+            long metadataTimeout = Math.max(timeToNextMetadataUpdate, waitForMetadataFetch);
+            if (metadataTimeout > 0) {
+                return metadataTimeout;
+            }
+
+            // Beware that the behavior of this method and the computation of timeouts for poll() are
+            // highly dependent on the behavior of leastLoadedNode.
+            Node node = leastLoadedNode(now);
+            if (node == null) {
+                log.debug("Give up sending metadata request since no node is available");
+                return reconnectBackoffMs;
+            }
+
+            return maybeUpdate(now, node);
+        }
+        ...
+    }
+    ...
+}
+```
+其中`leastLoadedNode`返回可以连接的服务节点。
+```java
+public class NetworkClient implements KafkaClient {
+    ...
+    @Override
+    public Node leastLoadedNode(long now) {
+        List<Node> nodes = this.metadataUpdater.fetchNodes();
+        if (nodes.isEmpty())
+            throw new IllegalStateException("There are no nodes in the Kafka cluster");
+        int inflight = Integer.MAX_VALUE;
+
+        Node foundConnecting = null;
+        Node foundCanConnect = null;
+        Node foundReady = null;
+
+        int offset = this.randOffset.nextInt(nodes.size());
+        for (int i = 0; i < nodes.size(); i++) {
+            int idx = (offset + i) % nodes.size();
+            Node node = nodes.get(idx);
+            if (canSendRequest(node.idString(), now)) {
+                int currInflight = this.inFlightRequests.count(node.idString());
+                if (currInflight == 0) {
+                    // if we find an established connection with no in-flight requests we can stop right away
+                    log.trace("Found least loaded node {} connected with no in-flight requests", node);
+                    return node;
+                } else if (currInflight < inflight) {
+                    // otherwise if this is the best we have found so far, record that
+                    inflight = currInflight;
+                    foundReady = node;
+                }
+            } else if (connectionStates.isPreparingConnection(node.idString())) {
+                foundConnecting = node;
+            } else if (canConnect(node, now)) {
+                if (foundCanConnect == null ||
+                        this.connectionStates.lastConnectAttemptMs(foundCanConnect.idString()) >
+                                this.connectionStates.lastConnectAttemptMs(node.idString())) {
+                    foundCanConnect = node;
+                }
+            } else {
+                log.trace("Removing node {} from least loaded node selection since it is neither ready " +
+                        "for sending or connecting", node);
+            }
+        }
+
+        // We prefer established connections if possible. Otherwise, we will wait for connections
+        // which are being established before connecting to new nodes.
+        if (foundReady != null) {
+            log.trace("Found least loaded node {} with {} inflight requests", foundReady, inflight);
+            return foundReady;
+        } else if (foundConnecting != null) {
+            log.trace("Found least loaded connecting node {}", foundConnecting);
+            return foundConnecting;
+        } else if (foundCanConnect != null) {
+            log.trace("Found least loaded node {} with no active connection", foundCanConnect);
+            return foundCanConnect;
+        } else {
+            log.trace("Least loaded node selection failed to find an available node");
+            return null;
+        }
+    }
+    ...
+}
+```
+最开始只能通过服务启动时传入的nodes参数取出nodes数组`List<Node> nodes = this.metadataUpdater.fetchNodes();`
+```java
+...
+    class DefaultMetadataUpdater implements MetadataUpdater {
+        @Override
+        public List<Node> fetchNodes() {
+            return metadata.fetch().nodes();
+        }
+    ...
+    }
+...
+```
+再随机取出一个节点更新元数据
+```java
+            int idx = (offset + i) % nodes.size();
+            Node node = nodes.get(idx);
+```
+而随着服务的运行，一部分节点中可能积压了没有处理完的数据，那么会遍历取出数据压力较小的节点。
+取出可用的节点后，继续更新`maybeUpdate(now, node)`：
+```java
+public class NetworkClient implements KafkaClient {
+    ...
+    class DefaultMetadataUpdater implements MetadataUpdater {
+        ...
+        private long maybeUpdate(long now, Node node) {
+            String nodeConnectionId = node.idString();
+
+            if (canSendRequest(nodeConnectionId, now)) {
+                Metadata.MetadataRequestAndVersion requestAndVersion = metadata.newMetadataRequestAndVersion(now);
+                MetadataRequest.Builder metadataRequest = requestAndVersion.requestBuilder;
+                log.debug("Sending metadata request {} to node {}", metadataRequest, node);
+                sendInternalMetadataRequest(metadataRequest, nodeConnectionId, now);
+                inProgress = new InProgressData(requestAndVersion.requestVersion, requestAndVersion.isPartialUpdate);
+                return defaultRequestTimeoutMs;
+            }
+
+            // If there's any connection establishment underway, wait until it completes. This prevents
+            // the client from unnecessarily connecting to additional nodes while a previous connection
+            // attempt has not been completed.
+            if (isAnyNodeConnecting()) {
+                // Strictly the timeout we should return here is "connect timeout", but as we don't
+                // have such application level configuration, using reconnect backoff instead.
+                return reconnectBackoffMs;
+            }
+
+            if (connectionStates.canConnect(nodeConnectionId, now)) {
+                // We don't have a connection to this node right now, make one
+                log.debug("Initialize connection to node {} for sending metadata request", node);
+                initiateConnect(node, now);
+                return reconnectBackoffMs;
+            }
+
+            // connected, but can't send more OR connecting
+            // In either case, we just need to wait for a network event to let us know the selected
+            // connection might be usable again.
+            return Long.MAX_VALUE;
+        }
+        ...
+    }
+    ...
+}
+```

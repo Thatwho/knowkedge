@@ -68,3 +68,42 @@ go 的导入路径：假如Go安装在`/usr/local/go`，环境变量`GOPATH`为`
 /home/mylibraries/src/net/http
 ```
 一旦找到一个满足import语句的包，就会停止查找。
+
+# go的类型系统
+## 内置类型
+* 数值类型
+* 字符串类型
+* 布尔类型
+
+## 引用类型
+* slice
+* map
+* channel
+* interface
+* func
+
+声明引用类型时创建的是header变量。header包含指向底层数据结构的指针，以及一组管理底层数据结构的字段。header是为了复制而设计的，不需要共享引用类型的值，复制header的值就是在共享底层数据结构。
+如果一种了类型的值其本质是非原始类型，那么应该使用共享，即返回指针的方式传递这个值。
+
+## 接口
+接口的值是两个字长度的数据结构，第一个字长度是iTable中的指针，第二个字存放的是指向实际值的指针。e.g.
+```go
+type notifier interface {
+    notify(){}
+}
+
+type person struct {
+    name string
+}
+
+func(person) notify() {}
+
+func main() {
+    var n notifier
+    n = person("lalala")
+}
+```
+变量n是接口`notifier`值，由两个字长，第一个字长指向iTable中`person`类型的定义，这个定义包含person类型的类型信息以及定义的一组方法。第二个字长指向`person("lalala")`实例的内存位置。
+
+编译器并不是总能获得一个值的地址，所以使用如果接口方法是通过指针实现的，那么只能把该类型的指针作为相应的接口值传递。因为传递值的时候，编译器不能获得该值的指针。
+
