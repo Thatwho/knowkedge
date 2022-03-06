@@ -339,3 +339,497 @@ Keycloak实现了UMA2.0授权规范。
 但是，网络银行服务允许Alice更改她的账户的授权策略。其中一条就是她可以定义允许谁查看她的账户。因此网络银行服务借助keycloak向Alice提供一项服务，Alice通过这项服务可以选择哪些个人以及操作可以被允许访问。Alice可以随时收回权限或授权其他权限给Bob。
 
 #### 授权流程
+当客户端尝试访问UMA保护的资源服务时，会触发UAM授权流程。
+UMA保护的服务需要请求携带bearer token，这个token是RPT。当客户端请求资源但是没有RPT时：
+```bash
+curl -X GET \
+  http://${host}:${port}/my-resource-server/resource/1bfdfe78-a4e1-4c2d-b142-fc92b75b986f
+```
+资源服务会返回携带`ticket`和`as_uri`参数的响应，as_uri参数是keycloak的端点，客户端使用`ticket`访问该端点以获取RPT。
+```bash
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: UMA realm="${realm}",
+    as_uri="https://${host}:${port}/realms/${realm}",
+    ticket="016f84e8-f9b9-11e0-bd6f-0021cc6004de"
+```
+权限票据是由keycloak权限API发布的特殊类型的token。他们代表了请求的权限，比如资源和作用域，以及其他和请求相关的信息。只有资源服务器可以创建这些token。
+现在客户端有了权限票据和keycloak的地址，客户端可以使用发现文档获取令牌端点的地址并发送授权请求。
+```bash
+curl -X POST \
+  http://${host}:${port}/realms/${realm}/protocol/openid-connect/token \
+  -H "Authorization: Bearer ${access_token}" \
+  --data "grant_type=urn:ietf:params:oauth:grant-type:uma-ticket" \
+  --data "ticket=${permission_ticket}
+```
+如果keycloak授权平贵结果是授予权限，则会返回包含权限的RPT
+```bash
+HTTP/1.1 200 OK
+Content-Type: application/json
+...
+{
+    "access_token": "${rpt}",
+}
+```
+和其他授权类型的相应一样，RPT可以从`access_token`字段获取。果如keycloak的评估结果是不授权，则返会403响应。
+```bash
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+...
+{
+    "error": "access_denied",
+    "error_description": "request_denied"
+}
+```
+
+#### 提交权限请求
+作为授权流程的一部分，客户端首先要从UMA保护的资源服务获取权限票据，然后再使用这个票据向keycloak的令牌端点交换RPT。
+如果不能给客户端授权，则keycloak会返回403状态码以及request_denied错误
+```bash
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+...
+{
+    "error": "access_denied",
+    "error_description": "request_denied"
+}
+```
+如果客户端希望使用异步授权流程，由资源拥有者决定是否授权请求，那么客户端可以使用`submit_request`请求参数：
+```bash
+curl -X POST \
+  http://${host}:${port}/realms/${realm}/protocol/openid-connect/token \
+  -H "Authorization: Bearer ${access_token}" \
+  --data "grant_type=urn:ietf:params:oauth:grant-type:uma-ticket" \
+  --data "ticket=${permission_ticket} \
+  --data "submit_request=true"
+```
+使用此参数，keycloak会保存被拒绝的权限请求，资源拥有者可以查看并管理这些权限请求。
+
+#### 管理对用户资源的访问
+用户可以使用keycloak的用户账户服务管理对他们资源的访问。
+
+### 保护接口
+保护接口是一组实现UMA规范的端点。包括
+* Resource Management
+资源服务器可以使用此端点远程管理他们的资源，并允许策略执行器查询需要他们保护的资源
+* Permission Management
+在UMA协议中，资源服务器访问这些端点创建权限票据。keycloak也提供了用于管理权限状态以及查询权限的票据。
+* Policy API
+通过这个端点，资源服务可以代表用户给资源试着权限策略。
+
+#### PAT的定义与获取
+Protection API Token/PAT是作用域为`uma_protection`的OAuth2令牌。当创建资源服务器时，keycloak自动创建一个名为`uma_protection`的角色。
+资源服务器可以向获取其他OAuth2访问令牌一样获取PAT：
+```bash
+curl -X POST \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d 'grant_type=client_credentials&client_id=${client_id}&client_secret=${client_secret}' \
+    "http://localhost:8080/realms/${realm_name}/protocol/openid-connect/token"
+```
+上例使用client_credential的授予类型获取PAT。服务器会返回如下响应：
+```json
+{
+  "access_token": ${PAT},
+  "expires_in": 300,
+  "refresh_expires_in": 1800,
+  "refresh_token": ${refresh_token},
+  "token_type": "bearer",
+  "id_token": ${id_token},
+  "not-before-policy": 0,
+  "session_state": "ccea4a55-9aec-4024-b11c-44f6f168439e"
+}
+```
+#### 管理资源
+资源服务器可以通过实现了UMA的端点远程管理他们的资源：
+```bash
+http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set
+```
+这个端点提供一下操作：
+##### 创建资源集合：POST /resource_set
+```bash
+curl -v -X POST \
+  http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set \
+  -H 'Authorization: Bearer '$pat \
+  -H 'Content-Type: application/json' \
+  -d '{
+     "name":"Tweedl Social Service",
+     "type":"http://www.example.com/rsrcs/socialstream/140-compatible",
+     "icon_uri":"http://www.example.com/icons/sharesocial.png",
+     "resource_scopes":[
+         "read-public",
+         "post-updates",
+         "read-private",
+         "http://www.example.com/scopes/all"
+      ]
+  }'
+```
+默认情况下，资源拥有者是资源服务，如果需要指定其他拥护者，比如某位用户，可以使用如下请求：
+```bash
+curl -v -X POST \
+  http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set \
+  -H 'Authorization: Bearer '$pat \
+  -H 'Content-Type: application/json' \
+  -d '{
+     "name":"Alice Resource",
+     "owner": "alice"
+  }
+```
+`owner`参数可以是用户名或id。
+创建用户管理的资源
+默认情况下，通过资源管理端点创建的资源不可以通过用户账户服务管理。如果要允许资源拥有者管理他们的资源，那么必须设置`ownerManagedAccess`
+```bash
+curl -v -X POST \
+  http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set \
+  -H 'Authorization: Bearer '$pat \
+  -H 'Content-Type: application/json' \
+  -d '{
+     "name":"Alice Resource",
+     "owner": "alice",
+     "ownerManagedAccess": true
+  }'
+```
+##### 读取资源集合：GET /resource_set/{id}
+```
+http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set/{resource_id}
+```
+##### 更新资源集合：PUT /resource_set/{id}
+```bash
+curl -v -X PUT \
+  http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set/{resource_id} \
+  -H 'Authorization: Bearer '$pat \
+  -H 'Content-Type: application/json' \
+  -d '{
+     "_id": "Alice Resource",
+     "name":"Alice Resource",
+     "resource_scopes": [
+        "read"
+     ]
+  }'
+```
+##### 删除资源集合：DELETE /resource_set/{id}
+```bash
+curl -v -X DELETE \
+  http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set/{resource_id} \
+  -H 'Authorization: Bearer '$pat
+```
+##### 列出资源集合：GET /resource_set
+```
+http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set?name=Alice Resource
+```
+使用name过滤参数，会返回所有匹配的资源结果。如果要精确匹配，使用
+```bash
+http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set?name=Alice Resource&exactName=true
+```
+按照uri查询
+```bash
+http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set?uri=/api/alice
+```
+查询指定`owner`的用户
+```bash
+http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set?owner=alice
+```
+查询指定类型的资源
+```bash
+http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set?type=albums
+```
+查询有相关作用域的资源
+```bash
+http://${host}:${port}/realms/${realm_name}/authz/protection/resource_set?scope=read
+```
+通过`first`和`max`限制返回的结果。
+
+#### 管理权限请求
+资源服务器可以使用特定的端点管理权限请求。这个端点提供实现了UMA流程的注册权限请求以及获取权限票据的功能。
+```bash
+http://${host}:${port}/realms/${realm_name}/authz/protection/permission
+```
+权限票据是一种安全令牌，可以表示请求的权限。
+大多数情况下，资源服务器不需要直接处理零零拍端点。KeyCloak提供了一个策略执行器，可以为资源服务器启用UMA，这样它就可以从授权服务器获取权限票证，将该票证返回给客户端应用程序，并基于最终请求方令牌（RPT）执行授权决策。
+获取权限票证的过程由资源服务器而非常规客户端应用程序执行，当客户端试图访问受保护的资源而没有访问该资源的必要授权时，就会获取权限票证。在使用UMA时，许可证的颁发是一个重要方面，因为它允许资源服务器：
+* 从客户端提取与资源服务器保护的资源相关联的数据
+* 在KeyCloak授权请求中注册，该授权请求随后可在工作流中用于根据资源所有者的同意授予访问权限
+* 将资源服务器与授权服务器分离，并允许它们使用不同的授权服务器保护和管理资源
+
+对客户端应用而言，权限票据可以：
+* 客户端不需要知道和资源关联的授权数据，授权票据对客户端而言是透明的
+* 客户端可以访问不同资源服务器上的资源和受不同授权服务器保护的资源
+
+##### 创建权限票据
+```bash
+curl -X POST \
+  http://${host}:${port}/realms/${realm_name}/authz/protection/permission \
+  -H 'Authorization: Bearer '$pat \
+  -H 'Content-Type: application/json' \
+  -d '[
+  {
+    "resource_id": "{resource_id}",
+    "resource_scopes": [
+      "view"
+    ]
+  }
+]'
+```
+创建票据时也可以提供额外的声明，把这些声明和票据关联：
+```bash
+curl -X POST \
+  http://${host}:${port}/realms/${realm_name}/authz/protection/permission \
+  -H 'Authorization: Bearer '$pat \
+  -H 'Content-Type: application/json' \
+  -d '[
+  {
+    "resource_id": "{resource_id}",
+    "resource_scopes": [
+      "view"
+    ],
+    "claims": {
+        "organization": ["acme"]
+    }
+  }
+]'
+```
+当评估与权限票据关联的资源和作用域的权限时，这些声明将可用于策略。
+
+##### 其他非UMA规范的端点
+###### 创建权限票据
+如果要给指定id{user_id}的用户授予id是{resource_id}的资源权限，那么资源拥有者需要发送如下请求
+```bash
+curl -X POST \
+     http://${host}:${port}/realms/${realm_name}/authz/protection/permission/ticket \
+     -H 'Authorization: Bearer '$access_token \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "resource": "{resource_id}",
+       "requester": "{user_id}",
+       "granted": true,
+       "scopeName": "view"
+     }'
+```
+###### 获取访问令牌
+```bash
+curl http://${host}:${port}/realms/${realm_name}/authz/protection/permission/ticket \
+     -H 'Authorization: Bearer '$access_token
+```
+可以使用下面的参数
+* scopeId
+* resourceId
+* owner
+* requester
+* granted
+* returnNames
+* first
+* max
+###### 更新权限票据
+```bash
+curl -X PUT \
+     http://${host}:${port}/realms/${realm_name}/authz/protection/permission/ticket \
+     -H 'Authorization: Bearer '$access_token \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "id": "{ticket_id}"
+       "resource": "{resource_id}",
+       "requester": "{user_id}",
+       "granted": false,
+       "scopeName": "view"
+     }'
+```
+###### 删除权限票据
+```bash
+curl -X DELETE http://${host}:${port}/realms/${realm_name}/authz/protection/permission/ticket/{ticket_id} \
+     -H 'Authorization: Bearer '$access_token
+```
+
+#### 使用策略API管理资源权限
+资源服务器可以代表用户使用策略接口把权限设置给资源。
+策略接口：
+```bash
+http://${host}:${port}/realms/${realm_name}/authz/protection/uma-policy/{resource_id}
+```
+使用此端点必须携带access token，表明用户授权当前资源服务器管理资源。令牌通过令牌端点使用以下方式获取：
+* 资源拥有者的密码授权类型
+* Token Exchange类型
+
+##### 把权限关联给资源
+```bash
+curl -X POST \
+  http://localhost:8180/realms/photoz/authz/protection/uma-policy/{resource_id} \
+  -H 'Authorization: Bearer '$access_token \
+  -H 'Cache-Control: no-cache' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "name": "Any people manager",
+        "description": "Allow access to any people manager",
+        "scopes": ["read"],
+        "roles": ["people-manager"]
+}'
+```
+上例中创建了新的权限，并关联给id是{resource_id}的资源，这个权限允许授予有`people-manager`角色的用户`read`作用域的权限。
+也可以使用其他访问控制机制创建策略，比如使用群组：
+```bash
+curl -X POST \
+  http://localhost:8180/realms/photoz/authz/protection/uma-policy/{resource_id} \
+  -H 'Authorization: Bearer '$access_token \
+  -H 'Cache-Control: no-cache' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "name": "Any people manager",
+        "description": "Allow access to any people manager",
+        "scopes": ["read"],
+        "groups": ["/Managers/People Managers"]
+}'
+```
+或指定的用户
+```bash
+curl -X POST \
+  http://localhost:8180/realms/photoz/authz/protection/uma-policy/{resource_id} \
+  -H 'Authorization: Bearer '$access_token \
+  -H 'Cache-Control: no-cache' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "name": "Any people manager",
+        "description": "Allow access to any people manager",
+        "scopes": ["read"],
+        "clients": ["my-client"]
+}'
+```
+甚至使用JavaScript定制策略
+```bash
+curl -X POST \
+  http://localhost:8180/realms/photoz/authz/protection/uma-policy/{resource_id} \
+  -H 'Authorization: Bearer '$access_token \
+  -H 'Cache-Control: no-cache' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "name": "Any people manager",
+        "description": "Allow access to any people manager",
+        "scopes": ["read"],
+        "condition": "if (isPeopleManager()) {$evaluation.grant()}"
+}'
+```
+也可以把这些机制组合起来创建策略。
+使用PUT方法可以更新存在的策略
+```bash
+curl -X PUT \
+  http://localhost:8180/realms/photoz/authz/protection/uma-policy/{permission_id} \
+  -H 'Authorization: Bearer '$access_token \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "id": "21eb3fed-02d7-4b5a-9102-29f3f09b6de2",
+    "name": "Any people manager",
+    "description": "Allow access to any people manager",
+    "type": "uma",
+    "scopes": [
+        "album:view"
+    ],
+    "logic": "POSITIVE",
+    "decisionStrategy": "UNANIMOUS",
+    "owner": "7e22131a-aa57-4f5f-b1db-6e82babcd322",
+    "roles": [
+        "user"
+    ]
+}'
+```
+
+##### 移除权限
+```bash
+curl -X DELETE \
+  http://localhost:8180/realms/photoz/authz/protection/uma-policy/{permission_id} \
+  -H 'Authorization: Bearer '$access_token
+```
+
+###### 查询权限
+```bash
+http://${host}:${port}/realms/${realm}/authz/protection/uma-policy?resource={resource_id}
+```
+根据名称查询
+```bash
+http://${host}:${port}/realms/${realm}/authz/protection/uma-policy?name=Any people manager
+```
+根据作用于查询
+```bash
+http://${host}:${port}/realms/${realm}/authz/protection/uma-policy?scope=read
+```
+查询所有的权限
+```bash
+http://${host}:${port}/realms/${realm}/authz/protection/uma-policy
+```
+使用`first`和`max`限制结果数量。
+
+### 请求方令牌
+请求方令牌时使用JWS签名的JWT。
+解码RPT可以看到如下负载信息：
+```json
+{
+  "authorization": {
+      "permissions": [
+        {
+          "resource_set_id": "d2fe9843-6462-4bfc-baba-b5787bb6e0e7",
+          "resource_set_name": "Hello World Resource"
+        }
+      ]
+  },
+  "jti": "d6109a09-78fd-4998-bf89-95730dfd0892-1464906679405",
+  "exp": 1464906971,
+  "nbf": 0,
+  "iat": 1464906671,
+  "sub": "f1888f4d-5172-4359-be0c-af338505d86c",
+  "typ": "kc_ett",
+  "azp": "hello-world-authz-service"
+}
+```
+通过令牌的`permissions`字段可以获取服务器授予的所有权限。
+
+#### RPT检查
+有时资源服务器会需要检查RPT的有效性，或者取出其中的权限执行授权策略。
+有以下两种主要场景：
+* 客户端应用需要请求令牌有效性以获取新的令牌
+* 资源服务器执行授权决策时，特别是没有内置的策略执行器适用于当前应用的时候
+
+#### 获取RPT的信息
+令牌检查端点是一个完全实现OAuth2令牌检查功能的端点，通过此端点可以获取RPT信息
+```bash
+http://${host}:${port}/realms/${realm_name}/protocol/openid-connect/token/introspect
+```
+使用如下请求检查RPT的信息
+```bash
+curl -X POST \
+    -H "Authorization: Basic aGVsbG8td29ybGQtYXV0aHotc2VydmljZTpzZWNyZXQ=" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d 'token_type_hint=requesting_party_token&token=${RPT}' \
+    "http://localhost:8080/realms/hello-world-authz/protocol/openid-connect/token/introspect"
+```
+此端点需要两个参数
+* token_type_hint
+使用`requesting_party_token`作为参数值，告诉服务器要做令牌检查
+* token
+
+相应如下
+```json
+{
+  "permissions": [
+    {
+      "resource_id": "90ccc6fc-b296-4cd1-881e-089e1ee15957",
+      "resource_name": "Hello World Resource"
+    }
+  ],
+  "exp": 1465314139,
+  "nbf": 0,
+  "iat": 1465313839,
+  "aud": "hello-world-authz-service",
+  "active": true
+}
+```
+如果RPT无效，则响应如下
+```bash
+{
+  "active": false
+}
+```
+
+### JAVA接口
+
+## 策略执行器
+策略执行点 / PEP是一种设计模式，可以用不同的方式实现他。Keycloak提供了不同的平台、环境以及编程语言实现PEP的方法。Keycloak授权服务提供了一组RESTful接口，并利用OAuth2授权功能，使用集中授权服务器进行细粒度授权。
+![pep-pattern-diagram](./assistant/pep-pattern-diagram.png)
+PEP服务根据keycloak的响应执行是否授权访问的决策。它在应用程序中充当过滤器或拦截器，以检查是否可以根据这些决定授予的权限满足对受保护资源的特定请求。
+权限的授予决定基于使用的协议、。如果使用UMA，那么策略执行器需要从bearer令牌获取RPT。所以客户端应用可以在访问资源服务器之前先请求keycloak，获取RPT。
+如果不使用UMA，那么客户端可以直接使用access token，这时PEP会直接向keycloak服务查询权限。
+策略执行器与应用程序的路径以及使用KeyCloak管理控制台为资源服务器创建的资源密切相关。默认情况下，创建资源服务器时，KeyCloak会为资源服务器创建一个默认配置，以便快速启用策略实施。
